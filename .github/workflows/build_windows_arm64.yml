@@ -37,12 +37,13 @@ jobs:
         with:
           channel: stable
           cache: true
+          # 宿主机仍然是 x64，这里不应修改，因为我们需要在 x64 机器上运行 Flutter 工具
           architecture: x64
 
       - name: 初始化 Rust 工具链
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          # 添加 ARM64 目标支持
+          # 关键修改：添加 ARM64 编译目标，否则 Rust 依赖会报错
           target: aarch64-pc-windows-msvc
 
       - name: 还原依赖
@@ -53,20 +54,22 @@ jobs:
 
       - name: 构建项目
         shell: pwsh
-        # 添加 CMake 参数指定 ARM64 架构
+        # 关键修改：使用环境变量指定 CMake 目标架构为 ARM64
+        # 比直接传参更稳定，避免了参数解析错误
+        env:
+          CMAKE_GENERATOR_PLATFORM: ARM64
         run: |-
           flutter build windows `
             --no-pub `
             --build-name=${{ steps.gitversion.outputs.majorMinorPatch }} `
-            --build-number=${{ steps.gitversion.outputs.buildMetaData }} `
-            -- --cmake-args="-A ARM64"
+            --build-number=${{ steps.gitversion.outputs.buildMetaData }}
 
       - name: 上传产物
         id: binary-artifact
         uses: actions/upload-artifact@v6
         with:
           name: binary
-          # 路径从 x64 变更为 arm64
+          # 路径修改：从 x64 变更为 arm64
           path: build/windows/arm64/runner/Release/**/*
           compression-level: 9
 
@@ -93,7 +96,8 @@ jobs:
         env:
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
         run: |-
-          # 添加 architecture 参数并指定 arm64
+          # 修改：添加 --architecture arm64
+          # 这会确保 AppxManifest.xml 中的处理器架构被正确设置为 ARM64
           dart run msix:create `
             --certificate-path '${{ steps.restore-cert.outputs.CERTIFICATE_PATH }}' `
             --certificate-password $env:CERTIFICATE_PASSWORD `
@@ -108,7 +112,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: msix
-          # 路径从 x64 变更为 arm64
+          # 路径修改：从 x64 变更为 arm64
           path: build/windows/arm64/runner/Release/pixez.msix
           compression-level: 9
 
@@ -117,7 +121,7 @@ jobs:
         if: steps.msix.conclusion == 'success'
         uses: frg2089/MsixInstaller@v2
         with:
-          # 路径从 x64 变更为 arm64
+          # 路径修改：从 x64 变更为 arm64
           msix: build/windows/arm64/runner/Release/pixez.msix
 
       - name: 上传 MSIX 安装器
@@ -168,7 +172,7 @@ jobs:
 
       - name: Download a Loose Artifact
         shell: pwsh
-        # 修改下载后的文件名为 windows-arm64.zip
+        # 修改：下载后重命名为 windows-arm64.zip，避免与 x64 混淆
         run: Invoke-WebRequest -UseBasicParsing -Uri '${{ needs.build.outputs.binary-artifact }}' -OutFile "artifacts/windows-arm64.zip"
 
       - name: Download a Msix Artifact
