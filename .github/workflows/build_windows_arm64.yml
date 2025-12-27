@@ -1,0 +1,191 @@
+name: Build Windows ARM64
+
+on:
+  push:
+  pull_request: 
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows ARM64
+    runs-on: windows-latest
+    outputs:
+      binary-artifact: ${{ steps.binary-artifact.outputs.artifact-url }}
+      msix-conclusion: ${{ steps.msix.conclusion }}
+      installer-conclusion: ${{ steps.installer.conclusion }}
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 初始化 GitVersion
+        uses: gittools/actions/gitversion/setup@v4.2.0
+        with:
+          versionSpec: '6.4.x'
+
+      - name: 计算版本 Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v4.2.0
+        with:
+          overrideConfig: |
+            assembly-versioning-scheme=MajorMinorPatchTag
+            assembly-file-versioning-format="{Major}.{Minor}.{Patch}.{BuildMetaData ?? 0}"
+
+      - name: 初始化 Flutter 环境
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          architecture: x64
+
+      - name: 初始化 Rust 工具链
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # 添加 ARM64 目标支持
+          target: aarch64-pc-windows-msvc
+
+      - name: 还原依赖
+        run: flutter pub get --no-example --enforce-lockfile
+
+      - name: 生成代码
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 构建项目
+        shell: pwsh
+        # 添加 CMake 参数指定 ARM64 架构
+        run: |-
+          flutter build windows `
+            --no-pub `
+            --build-name=${{ steps.gitversion.outputs.majorMinorPatch }} `
+            --build-number=${{ steps.gitversion.outputs.buildMetaData }} `
+            -- --cmake-args="-A ARM64"
+
+      - name: 上传产物
+        id: binary-artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: binary
+          # 路径从 x64 变更为 arm64
+          path: build/windows/arm64/runner/Release/**/*
+          compression-level: 9
+
+      - name: 还原证书
+        id: restore-cert
+        shell: pwsh
+        if: env.CERTIFICATE != ''
+        env:
+          CERTIFICATE: ${{ secrets.CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+        run: |-
+          $certFile = (New-TemporaryFile).FullName + '.pfx'
+          [System.IO.File]::WriteAllBytes($certFile, [System.Convert]::FromBase64String($env:CERTIFICATE))
+          $Private:Password = ConvertTo-SecureString -String $env:CERTIFICATE_PASSWORD -AsPlainText
+          $Private:Certificate = Get-PfxCertificate $certFile -Password $Private:Password
+          $Private:Certificate.Subject
+          Write-Output "CERTIFICATE_PATH=$certFile" >> "$env:GITHUB_OUTPUT"
+          Write-Output "CERTIFICATE_SUBJECT=$($Private:Certificate.Subject)" >> "$env:GITHUB_OUTPUT"
+
+      - name: 构建 MSIX
+        id: msix
+        shell: pwsh
+        if: steps.restore-cert.conclusion == 'success'
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+        run: |-
+          # 添加 architecture 参数并指定 arm64
+          dart run msix:create `
+            --certificate-path '${{ steps.restore-cert.outputs.CERTIFICATE_PATH }}' `
+            --certificate-password $env:CERTIFICATE_PASSWORD `
+            --build-windows false `
+            --architecture arm64 `
+            --version '${{ steps.gitversion.outputs.assemblySemVer }}' `
+            --publisher '${{ steps.restore-cert.outputs.CERTIFICATE_SUBJECT }}'
+
+      - name: 上传 MSIX
+        id: msix-artifact
+        if: steps.msix.conclusion == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: msix
+          # 路径从 x64 变更为 arm64
+          path: build/windows/arm64/runner/Release/pixez.msix
+          compression-level: 9
+
+      - name: 生成 MSIX 安装器
+        id: installer
+        if: steps.msix.conclusion == 'success'
+        uses: frg2089/MsixInstaller@v2
+        with:
+          # 路径从 x64 变更为 arm64
+          msix: build/windows/arm64/runner/Release/pixez.msix
+
+      - name: 上传 MSIX 安装器
+        id: installer-artifact
+        if: steps.installer.conclusion == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: installer
+          path: ${{ steps.installer.outputs.path }}
+          compression-level: 9
+
+      - name: 生成校验和
+        shell: pwsh
+        run: |-
+          Write-Output '### Build Success (ARM64) :rocket:' >> $env:GITHUB_STEP_SUMMARY
+
+          if ($env:CERTIFICATE_SUBJECT) {
+            Write-Output "Publisher: $env:CERTIFICATE_SUBJECT" >> $env:GITHUB_STEP_SUMMARY  
+          }
+
+          Write-Output '|File|SHA256|' >> $env:GITHUB_STEP_SUMMARY
+          Write-Output '|:-|:-:|' >> $env:GITHUB_STEP_SUMMARY
+          Write-Output "|[binary](${{ steps.binary-artifact.outputs.artifact-url }})|${{ steps.binary-artifact.outputs.artifact-digest }}|" >> $env:GITHUB_STEP_SUMMARY
+
+          if ('${{ steps.msix-artifact.conclusion }}' -eq 'success') {
+            Write-Output "|[msix](${{ steps.msix-artifact.outputs.artifact-url }})|${{ steps.msix-artifact.outputs.artifact-digest }}|" >> $env:GITHUB_STEP_SUMMARY  
+          }
+
+          if ('${{ steps.installer-artifact.conclusion }}' -eq 'success') {
+            Write-Output "|[installer](${{ steps.installer-artifact.outputs.artifact-url }})|${{ steps.installer-artifact.outputs.artifact-digest }}|" >> $env:GITHUB_STEP_SUMMARY  
+          }
+
+          Write-Output '' >> $env:GITHUB_STEP_SUMMARY
+          Write-Output '### MSIX 安装教程' >> $env:GITHUB_STEP_SUMMARY
+          Write-Output '![image](https://github.com/Notsfsssf/pixez-flutter/assets/42184238/f1956682-f527-487d-997b-523319cd78d3)' >> $env:GITHUB_STEP_SUMMARY
+
+  publish:
+    needs: build
+    name: 发布
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      discussions: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v6
+
+      - name: Download a Loose Artifact
+        shell: pwsh
+        # 修改下载后的文件名为 windows-arm64.zip
+        run: Invoke-WebRequest -UseBasicParsing -Uri '${{ needs.build.outputs.binary-artifact }}' -OutFile "artifacts/windows-arm64.zip"
+
+      - name: Download a Msix Artifact
+        if: needs.build.outputs.msix-conclusion == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          name: msix
+          path: artifacts
+
+      - name: Download a Msix Installer Artifact
+        if: needs.build.outputs.installer-conclusion == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          name: installer
+          path: artifacts
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
