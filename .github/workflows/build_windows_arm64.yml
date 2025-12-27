@@ -37,13 +37,11 @@ jobs:
         with:
           channel: stable
           cache: true
-          # 宿主机仍然是 x64，这里不应修改，因为我们需要在 x64 机器上运行 Flutter 工具
           architecture: x64
 
       - name: 初始化 Rust 工具链
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          # 关键修改：添加 ARM64 编译目标，否则 Rust 依赖会报错
           target: aarch64-pc-windows-msvc
 
       - name: 还原依赖
@@ -54,10 +52,9 @@ jobs:
 
       - name: 构建项目
         shell: pwsh
-        # 关键修复：
-        # 1. 设置 CMAKE_GENERATOR 为 "Visual Studio 17 2022"，强制使用 VS 生成器而非 Ninja
-        # 2. 保留 CMAKE_GENERATOR_PLATFORM 指定 ARM64 架构
         env:
+          # 1. 强制使用 VS2022 生成器
+          # 2. 只有 VS 生成器支持通过环境变量指定 ARM64 目标架构
           CMAKE_GENERATOR: "Visual Studio 17 2022"
           CMAKE_GENERATOR_PLATFORM: ARM64
         run: |-
@@ -66,12 +63,37 @@ jobs:
             --build-name=${{ steps.gitversion.outputs.majorMinorPatch }} `
             --build-number=${{ steps.gitversion.outputs.buildMetaData }}
 
+      - name: 修正输出目录结构 (Fix Path)
+        shell: pwsh
+        run: |-
+          Write-Host "Checking build output..."
+          # 此时 Flutter 还是把 ARM64 的产物放在了 x64 文件夹里
+          $x64Path = "build/windows/x64"
+          $arm64Path = "build/windows/arm64"
+
+          if (Test-Path $x64Path) {
+              Write-Host "Build output found at $x64Path. Renaming to $arm64Path..."
+              
+              # 如果 arm64 目录意外存在（例如缓存残留），先强制删除
+              if (Test-Path $arm64Path) {
+                  Remove-Item -Path $arm64Path -Recurse -Force
+              }
+
+              # 将 x64 目录重命名为 arm64
+              Rename-Item -Path $x64Path -NewName "arm64"
+              
+              Write-Host "Directory renamed successfully."
+          } else {
+              Write-Error "CRITICAL: Build output directory '$x64Path' not found!"
+              exit 1
+          }
+
       - name: 上传产物
         id: binary-artifact
         uses: actions/upload-artifact@v6
         with:
           name: binary
-          # 路径修改：从 x64 变更为 arm64
+          # 经过上面的重命名，现在文件确实在 arm64 目录里了
           path: build/windows/arm64/runner/Release/**/*
           compression-level: 9
 
@@ -98,8 +120,8 @@ jobs:
         env:
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
         run: |-
-          # 修改：添加 --architecture arm64
-          # 这会确保 AppxManifest.xml 中的处理器架构被正确设置为 ARM64
+          # 指定架构为 arm64，msix 工具会去 build/windows/arm64 寻找文件
+          # 我们上面的重命名操作确保了这一点
           dart run msix:create `
             --certificate-path '${{ steps.restore-cert.outputs.CERTIFICATE_PATH }}' `
             --certificate-password $env:CERTIFICATE_PASSWORD `
@@ -114,7 +136,6 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: msix
-          # 路径修改：从 x64 变更为 arm64
           path: build/windows/arm64/runner/Release/pixez.msix
           compression-level: 9
 
@@ -123,7 +144,6 @@ jobs:
         if: steps.msix.conclusion == 'success'
         uses: frg2089/MsixInstaller@v2
         with:
-          # 路径修改：从 x64 变更为 arm64
           msix: build/windows/arm64/runner/Release/pixez.msix
 
       - name: 上传 MSIX 安装器
@@ -174,7 +194,6 @@ jobs:
 
       - name: Download a Loose Artifact
         shell: pwsh
-        # 修改：下载后重命名为 windows-arm64.zip，避免与 x64 混淆
         run: Invoke-WebRequest -UseBasicParsing -Uri '${{ needs.build.outputs.binary-artifact }}' -OutFile "artifacts/windows-arm64.zip"
 
       - name: Download a Msix Artifact
