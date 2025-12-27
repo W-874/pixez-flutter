@@ -50,41 +50,70 @@ jobs:
       - name: 生成代码
         run: dart run build_runner build --delete-conflicting-outputs
 
+      # 【核心修复 1】移除 Ninja
+      # 强迫 Flutter 使用 Visual Studio 生成器，否则它会忽略 ARM64 设置
+      - name: 移除 Ninja (Force MSVC)
+        shell: pwsh
+        run: |-
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if ($ninja) {
+            Write-Host "Found Ninja at $($ninja.Source). Removing it from PATH to force MSVC..."
+            # 在当前会话中移除 Ninja 所在的路径
+            $env:Path = ($env:Path -split ';' | Where-Object { $_ -ne (Split-Path $ninja.Source) }) -join ';'
+            Write-Host "Ninja removed from PATH."
+          } else {
+            Write-Host "Ninja not found. Good."
+          }
+
+      # 【核心修复 2】强制修改 CMakeLists.txt
+      # 确保在使用 MSVC 时，ARM64 配置被正确写入
+      - name: 强制修改 CMake 配置以支持 ARM64
+        shell: pwsh
+        run: |-
+          $cmakePath = "windows/CMakeLists.txt"
+          if (Test-Path $cmakePath) {
+            $content = Get-Content $cmakePath -Raw
+            $pattern = "(cmake_minimum_required\s*\(.*?\))"
+            # 强制设置 Generator Platform 为 ARM64
+            $replacement = "$1`nset(CMAKE_GENERATOR_PLATFORM `"ARM64`" CACHE STRING `"`" FORCE)"
+            
+            if ($content -match $pattern) {
+              $newContent = $content -replace $pattern, $replacement
+              Set-Content $cmakePath $newContent
+              Write-Host "Success: Patched CMakeLists.txt."
+            } else {
+              Write-Error "Error: Could not patch CMakeLists.txt"
+              exit 1
+            }
+          }
+
       - name: 构建项目
         shell: pwsh
         env:
-          # 1. 强制使用 VS2022 生成器
-          # 2. 只有 VS 生成器支持通过环境变量指定 ARM64 目标架构
+          # 配合上面的移除 Ninja，这里显式声明使用 VS
           CMAKE_GENERATOR: "Visual Studio 17 2022"
-          CMAKE_GENERATOR_PLATFORM: ARM64
         run: |-
           flutter build windows `
             --no-pub `
             --build-name=${{ steps.gitversion.outputs.majorMinorPatch }} `
             --build-number=${{ steps.gitversion.outputs.buildMetaData }}
 
+      # 修正 Flutter 错误的输出路径
       - name: 修正输出目录结构 (Fix Path)
         shell: pwsh
         run: |-
-          Write-Host "Checking build output..."
-          # 此时 Flutter 还是把 ARM64 的产物放在了 x64 文件夹里
           $x64Path = "build/windows/x64"
           $arm64Path = "build/windows/arm64"
-
-          if (Test-Path $x64Path) {
-              Write-Host "Build output found at $x64Path. Renaming to $arm64Path..."
-              
-              # 如果 arm64 目录意外存在（例如缓存残留），先强制删除
-              if (Test-Path $arm64Path) {
-                  Remove-Item -Path $arm64Path -Recurse -Force
-              }
-
-              # 将 x64 目录重命名为 arm64
+          
+          # 检查 x64 路径（因为 Flutter 即使在 ARM64 模式下也可能输出到 x64 文件夹）
+          if (Test-Path "$x64Path/runner/Release") {
+              Write-Host "Artifacts found in x64 folder. Renaming to arm64..."
+              if (Test-Path $arm64Path) { Remove-Item -Path $arm64Path -Recurse -Force }
               Rename-Item -Path $x64Path -NewName "arm64"
-              
-              Write-Host "Directory renamed successfully."
+          } elseif (Test-Path "$arm64Path/runner/Release") {
+              Write-Host "Artifacts already in arm64 folder."
           } else {
-              Write-Error "CRITICAL: Build output directory '$x64Path' not found!"
+              Write-Error "Build failed: No artifacts found in x64 or arm64 folders."
               exit 1
           }
 
@@ -93,13 +122,14 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: binary
-          # 经过上面的重命名，现在文件确实在 arm64 目录里了
           path: build/windows/arm64/runner/Release/**/*
           compression-level: 9
 
+      # 证书步骤：如果你没有配置 Secrets，这步及之后都会被跳过
       - name: 还原证书
         id: restore-cert
         shell: pwsh
+        # 只有配置了 CERTIFICATE Secret 才会运行
         if: env.CERTIFICATE != ''
         env:
           CERTIFICATE: ${{ secrets.CERTIFICATE }}
@@ -116,12 +146,11 @@ jobs:
       - name: 构建 MSIX
         id: msix
         shell: pwsh
+        # 只有证书步骤成功才会运行
         if: steps.restore-cert.conclusion == 'success'
         env:
           CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
         run: |-
-          # 指定架构为 arm64，msix 工具会去 build/windows/arm64 寻找文件
-          # 我们上面的重命名操作确保了这一点
           dart run msix:create `
             --certificate-path '${{ steps.restore-cert.outputs.CERTIFICATE_PATH }}' `
             --certificate-password $env:CERTIFICATE_PASSWORD `
@@ -168,6 +197,7 @@ jobs:
           Write-Output '|:-|:-:|' >> $env:GITHUB_STEP_SUMMARY
           Write-Output "|[binary](${{ steps.binary-artifact.outputs.artifact-url }})|${{ steps.binary-artifact.outputs.artifact-digest }}|" >> $env:GITHUB_STEP_SUMMARY
 
+          # 这里的判断是为了防止跳过步骤后日志报错
           if ('${{ steps.msix-artifact.conclusion }}' -eq 'success') {
             Write-Output "|[msix](${{ steps.msix-artifact.outputs.artifact-url }})|${{ steps.msix-artifact.outputs.artifact-digest }}|" >> $env:GITHUB_STEP_SUMMARY  
           }
